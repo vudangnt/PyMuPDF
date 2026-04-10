@@ -1,6 +1,9 @@
 import urllib.request
 import urllib.parse
 import asyncio
+import subprocess
+import tempfile
+import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 from pathlib import PurePosixPath
@@ -76,6 +79,25 @@ def _fetch_url(url: str) -> tuple[bytes, str]:
     return content, filename
 
 
+def _ocr_page_subprocess(page: pymupdf.Page, language: str) -> str:
+    """OCR a page by rendering to image and calling tesseract as subprocess."""
+    pix = page.get_pixmap(dpi=300)
+    img_bytes = pix.tobytes("png")
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        f.write(img_bytes)
+        img_path = f.name
+    try:
+        result = subprocess.run(
+            ["tesseract", img_path, "stdout", "-l", language, "--psm", "3"],
+            capture_output=True, text=True, timeout=60,
+        )
+        return result.stdout
+    except Exception:
+        return ""
+    finally:
+        os.unlink(img_path)
+
+
 def _extract_page_text(page: pymupdf.Page, mode: str, ocr: str) -> str:
     """Extract text from a single page. Falls back to OCR if text is sparse."""
     if mode == "blocks":
@@ -88,12 +110,9 @@ def _extract_page_text(page: pymupdf.Page, mode: str, ocr: str) -> str:
         text = page.get_text("text")
 
     if ocr != "off" and len(text.strip()) < TEXT_THRESHOLD:
-        try:
-            ocr_text = page.get_textpage_ocr(flags=0, language=ocr, dpi=300).extractText()
-            if len(ocr_text.strip()) > len(text.strip()):
-                return ocr_text
-        except Exception:
-            pass
+        ocr_text = _ocr_page_subprocess(page, ocr)
+        if len(ocr_text.strip()) > len(text.strip()):
+            return ocr_text
     return text
 
 
