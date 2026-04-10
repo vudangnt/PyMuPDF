@@ -1,5 +1,7 @@
 import urllib.request
 import urllib.parse
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 from pathlib import PurePosixPath
 
@@ -11,16 +13,22 @@ from api.config import settings
 
 app = FastAPI(
     title="PDF to Text API",
-    description="Extract text from PDF and other documents using PyMuPDF",
-    version="1.0.0",
+    description="Extract text from PDF and other documents using PyMuPDF (with OCR support)",
+    version="1.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
 
+_ocr_pool = ThreadPoolExecutor(max_workers=2)
+
 SUPPORTED_EXTENSIONS = {
     ".pdf", ".epub", ".xps", ".fb2", ".cbz", ".svg",
     ".txt", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx",
+    ".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif",
 }
+
+OCR_LANGUAGES = "eng+vie"
+TEXT_THRESHOLD = 20  # min chars per page to consider it has real text
 
 
 def _parse_page_range(pages_str: str, total_pages: int) -> list[int]:
@@ -40,21 +48,6 @@ def _ext_from_filename(filename: str) -> str:
         return ""
     return "." + filename.rsplit(".", 1)[-1].lower()
 
-
-def _open_document(file_bytes: bytes, filename: str) -> pymupdf.Document:
-    ext = _ext_from_filename(filename)
-    if ext not in SUPPORTED_EXTENSIONS:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Unsupported file type: {ext or 'unknown'}",
-        )
-    try:
-        return pymupdf.open(stream=file_bytes, filetype=ext.lstrip("."))
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Failed to open document: {exc}",
-        )
 
 
 def _fetch_url(url: str) -> tuple[bytes, str]:
@@ -83,18 +76,52 @@ def _fetch_url(url: str) -> tuple[bytes, str]:
     return content, filename
 
 
-def _extract_text(doc: pymupdf.Document, mode: str) -> list[str]:
-    pages_text = []
-    for page in doc:
-        if mode == "text":
-            pages_text.append(page.get_text("text"))
-        elif mode == "blocks":
-            blocks = page.get_text("blocks")
-            pages_text.append("\n".join(b[4] for b in blocks if b[6] == 0))
-        else:  # words
-            words = page.get_text("words")
-            pages_text.append(" ".join(w[4] for w in words))
-    return pages_text
+def _extract_page_text(page: pymupdf.Page, mode: str, ocr: str) -> str:
+    """Extract text from a single page. Falls back to OCR if text is sparse."""
+    if mode == "blocks":
+        blocks = page.get_text("blocks")
+        text = "\n".join(b[4] for b in blocks if b[6] == 0)
+    elif mode == "words":
+        words = page.get_text("words")
+        text = " ".join(w[4] for w in words)
+    else:
+        text = page.get_text("text")
+
+    if ocr != "off" and len(text.strip()) < TEXT_THRESHOLD:
+        try:
+            ocr_text = page.get_textpage_ocr(flags=0, language=ocr, dpi=300).extractText()
+            if len(ocr_text.strip()) > len(text.strip()):
+                return ocr_text
+        except Exception:
+            pass
+    return text
+
+
+def _process_document(file_bytes: bytes, filename: str, mode: str, ocr_lang: str,
+                      page_indices: list[int] | None = None) -> dict:
+    """Sync function to process document - safe for ThreadPoolExecutor."""
+    ext = _ext_from_filename(filename)
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise ValueError(f"Unsupported file type: {ext or 'unknown'}")
+    try:
+        doc = pymupdf.open(stream=file_bytes, filetype=ext.lstrip("."))
+    except Exception as exc:
+        raise ValueError(f"Failed to open document: {exc}")
+
+    try:
+        total = len(doc)
+        if page_indices is not None:
+            pages = []
+            for i in page_indices:
+                text = _extract_page_text(doc[i], mode, ocr_lang)
+                pages.append({"page": i + 1, "text": text})
+            return {"total_pages": total, "pages": pages}
+        else:
+            texts = [_extract_page_text(page, mode, ocr_lang) for page in doc]
+            full_text = "\n\n".join(texts)
+            return {"total_pages": total, "text": full_text, "char_count": len(full_text)}
+    finally:
+        doc.close()
 
 
 @app.get("/health")
@@ -128,23 +155,28 @@ async def extract(
     file: UploadFile = File(None),
     url: str = Form(None),
     mode: Literal["text", "blocks", "words"] = Form("text"),
+    ocr: str = Form("auto", description="OCR language: 'auto' (eng+vie fallback), 'off', or Tesseract lang code e.g. 'eng+vie'"),
     _key: str = Depends(verify_api_key),
 ):
-    """Extract text from entire document. Provide either `file` (upload) or `url`."""
+    """Extract text from entire document. Provide either `file` (upload) or `url`.
+    OCR auto-activates when page has little/no text (image-based PDF)."""
     content, filename = await _resolve_input(file, url)
+    ocr_lang = OCR_LANGUAGES if ocr == "auto" else ocr
 
-    doc = _open_document(content, filename)
+    loop = asyncio.get_event_loop()
     try:
-        pages_text = _extract_text(doc, mode)
-        full_text = "\n\n".join(pages_text)
-        return {
-            "source": url or filename,
-            "pages": len(doc),
-            "text": full_text,
-            "char_count": len(full_text),
-        }
-    finally:
-        doc.close()
+        result = await loop.run_in_executor(
+            _ocr_pool, _process_document, content, filename, mode, ocr_lang, None
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    return {
+        "source": url or filename,
+        "pages": result["total_pages"],
+        "text": result["text"],
+        "char_count": result["char_count"],
+        "ocr": ocr_lang != "off",
+    }
 
 
 @app.post("/extract/pages")
@@ -153,34 +185,34 @@ async def extract_pages(
     url: str = Form(None),
     pages: str = Form(None, description="Page range e.g. '1-3,5' (default: all)"),
     mode: Literal["text", "blocks", "words"] = Form("text"),
+    ocr: str = Form("auto", description="OCR language: 'auto' (eng+vie fallback), 'off', or Tesseract lang code"),
     _key: str = Depends(verify_api_key),
 ):
-    """Extract text per page. Provide either `file` (upload) or `url`."""
+    """Extract text per page. Provide either `file` (upload) or `url`.
+    OCR auto-activates when page has little/no text (image-based PDF)."""
     content, filename = await _resolve_input(file, url)
+    ocr_lang = OCR_LANGUAGES if ocr == "auto" else ocr
 
-    doc = _open_document(content, filename)
+    # Need total pages first to parse range
     try:
+        doc = pymupdf.open(stream=content, filetype=_ext_from_filename(filename).lstrip("."))
         total = len(doc)
-        indices = _parse_page_range(pages, total) if pages else list(range(total))
-
-        result_pages = []
-        for i in indices:
-            page = doc[i]
-            if mode == "text":
-                text = page.get_text("text")
-            elif mode == "blocks":
-                blocks = page.get_text("blocks")
-                text = "\n".join(b[4] for b in blocks if b[6] == 0)
-            else:
-                words = page.get_text("words")
-                text = " ".join(w[4] for w in words)
-            result_pages.append({"page": i + 1, "text": text})
-
-        return {
-            "source": url or filename,
-            "total_pages": total,
-            "extracted_pages": len(result_pages),
-            "pages": result_pages,
-        }
-    finally:
         doc.close()
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"Failed to open document: {exc}")
+
+    indices = _parse_page_range(pages, total) if pages else list(range(total))
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(
+            _ocr_pool, _process_document, content, filename, mode, ocr_lang, indices
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    return {
+        "source": url or filename,
+        "total_pages": result["total_pages"],
+        "extracted_pages": len(result["pages"]),
+        "pages": result["pages"],
+    }
