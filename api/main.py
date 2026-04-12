@@ -17,12 +17,12 @@ from api.config import settings
 app = FastAPI(
     title="PDF to Text API",
     description="Extract text from PDF and other documents using PyMuPDF (with OCR support)",
-    version="1.1.0",
+    version="1.2.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
 
-_ocr_pool = ThreadPoolExecutor(max_workers=2)
+_pool = ThreadPoolExecutor(max_workers=4)
 
 SUPPORTED_EXTENSIONS = {
     ".pdf", ".epub", ".xps", ".fb2", ".cbz", ".svg",
@@ -31,7 +31,8 @@ SUPPORTED_EXTENSIONS = {
 }
 
 OCR_LANGUAGES = "eng+vie"
-TEXT_THRESHOLD = 20  # min chars per page to consider it has real text
+TEXT_THRESHOLD = 20
+OCR_DPI = 200  # 200 đủ cho resume/doc, giảm từ 300 → nhanh ~2x
 
 
 def _parse_page_range(pages_str: str, total_pages: int) -> list[int]:
@@ -50,7 +51,6 @@ def _ext_from_filename(filename: str) -> str:
     if "." not in filename:
         return ""
     return "." + filename.rsplit(".", 1)[-1].lower()
-
 
 
 def _fetch_url(url: str) -> tuple[bytes, str]:
@@ -79,14 +79,12 @@ def _fetch_url(url: str) -> tuple[bytes, str]:
     return content, filename
 
 
-def _ocr_page_subprocess(page: pymupdf.Page, language: str) -> str:
-    """OCR a page by rendering to image and calling tesseract as subprocess."""
-    pix = page.get_pixmap(dpi=300)
-    img_bytes = pix.tobytes("png")
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        f.write(img_bytes)
-        img_path = f.name
+def _ocr_page_subprocess(img_bytes: bytes, language: str) -> str:
+    """OCR via temp file + tesseract subprocess."""
+    fd, img_path = tempfile.mkstemp(suffix=".png")
     try:
+        os.write(fd, img_bytes)
+        os.close(fd)
         result = subprocess.run(
             ["tesseract", img_path, "stdout", "-l", language, "--psm", "3"],
             capture_output=True, text=True, timeout=60,
@@ -95,7 +93,10 @@ def _ocr_page_subprocess(page: pymupdf.Page, language: str) -> str:
     except Exception:
         return ""
     finally:
-        os.unlink(img_path)
+        try:
+            os.unlink(img_path)
+        except OSError:
+            pass
 
 
 def _extract_page_text(page: pymupdf.Page, mode: str, ocr: str) -> str:
@@ -110,7 +111,9 @@ def _extract_page_text(page: pymupdf.Page, mode: str, ocr: str) -> str:
         text = page.get_text("text")
 
     if ocr != "off" and len(text.strip()) < TEXT_THRESHOLD:
-        ocr_text = _ocr_page_subprocess(page, ocr)
+        pix = page.get_pixmap(dpi=OCR_DPI)
+        img_bytes = pix.tobytes("png")
+        ocr_text = _ocr_page_subprocess(img_bytes, ocr)
         if len(ocr_text.strip()) > len(text.strip()):
             return ocr_text
     return text
@@ -118,7 +121,7 @@ def _extract_page_text(page: pymupdf.Page, mode: str, ocr: str) -> str:
 
 def _process_document(file_bytes: bytes, filename: str, mode: str, ocr_lang: str,
                       page_indices: list[int] | None = None) -> dict:
-    """Sync function to process document - safe for ThreadPoolExecutor."""
+    """Process document - runs in thread pool."""
     ext = _ext_from_filename(filename)
     if ext not in SUPPORTED_EXTENSIONS:
         raise ValueError(f"Unsupported file type: {ext or 'unknown'}")
@@ -129,16 +132,54 @@ def _process_document(file_bytes: bytes, filename: str, mode: str, ocr_lang: str
 
     try:
         total = len(doc)
-        if page_indices is not None:
-            pages = []
-            for i in page_indices:
-                text = _extract_page_text(doc[i], mode, ocr_lang)
-                pages.append({"page": i + 1, "text": text})
-            return {"total_pages": total, "pages": pages}
+        indices = page_indices if page_indices is not None else list(range(total))
+
+        # OCR pages in parallel when needed
+        ocr_needed = ocr_lang != "off"
+        if ocr_needed:
+            # Pre-check which pages need OCR
+            page_data = []
+            for i in indices:
+                page = doc[i]
+                text = page.get_text("text") if mode == "text" else ""
+                needs_ocr = len(text.strip()) < TEXT_THRESHOLD
+                if needs_ocr:
+                    pix = page.get_pixmap(dpi=OCR_DPI)
+                    page_data.append((i, text, pix.tobytes("png")))
+                else:
+                    page_data.append((i, None, None))
+
+            # Run OCR in parallel for pages that need it
+            ocr_results = {}
+            imgs_to_ocr = [(i, img) for i, _, img in page_data if img is not None]
+            if imgs_to_ocr:
+                with ThreadPoolExecutor(max_workers=min(4, len(imgs_to_ocr))) as ocr_pool:
+                    futures = {
+                        ocr_pool.submit(_ocr_page_subprocess, img, ocr_lang): i
+                        for i, img in imgs_to_ocr
+                    }
+                    for future in futures:
+                        ocr_results[futures[future]] = future.result()
+
+            # Assemble results
+            results = []
+            for i, orig_text, img in page_data:
+                if img is not None and i in ocr_results:
+                    ocr_text = ocr_results[i]
+                    text = ocr_text if len(ocr_text.strip()) > len((orig_text or "").strip()) else (orig_text or "")
+                else:
+                    text = _extract_page_text(doc[i], mode, "off")
+                results.append((i, text))
         else:
-            texts = [_extract_page_text(page, mode, ocr_lang) for page in doc]
-            full_text = "\n\n".join(texts)
-            return {"total_pages": total, "text": full_text, "char_count": len(full_text)}
+            results = [(i, _extract_page_text(doc[i], mode, "off")) for i in indices]
+
+        if page_indices is not None:
+            return {
+                "total_pages": total,
+                "pages": [{"page": i + 1, "text": t} for i, t in results],
+            }
+        full_text = "\n\n".join(t for _, t in results)
+        return {"total_pages": total, "text": full_text, "char_count": len(full_text)}
     finally:
         doc.close()
 
@@ -185,7 +226,7 @@ async def extract(
     loop = asyncio.get_event_loop()
     try:
         result = await loop.run_in_executor(
-            _ocr_pool, _process_document, content, filename, mode, ocr_lang, None
+            _pool, _process_document, content, filename, mode, ocr_lang, None
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
@@ -212,9 +253,11 @@ async def extract_pages(
     content, filename = await _resolve_input(file, url)
     ocr_lang = OCR_LANGUAGES if ocr == "auto" else ocr
 
-    # Need total pages first to parse range
+    loop = asyncio.get_event_loop()
     try:
-        doc = pymupdf.open(stream=content, filetype=_ext_from_filename(filename).lstrip("."))
+        # Quick open to get total pages for range parsing
+        ext = _ext_from_filename(filename)
+        doc = pymupdf.open(stream=content, filetype=ext.lstrip("."))
         total = len(doc)
         doc.close()
     except Exception as exc:
@@ -222,10 +265,9 @@ async def extract_pages(
                             detail=f"Failed to open document: {exc}")
 
     indices = _parse_page_range(pages, total) if pages else list(range(total))
-    loop = asyncio.get_event_loop()
     try:
         result = await loop.run_in_executor(
-            _ocr_pool, _process_document, content, filename, mode, ocr_lang, indices
+            _pool, _process_document, content, filename, mode, ocr_lang, indices
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
