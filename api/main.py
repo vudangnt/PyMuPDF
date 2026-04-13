@@ -4,12 +4,16 @@ import asyncio
 import subprocess
 import tempfile
 import os
+import re
+import io
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 from pathlib import PurePosixPath
 
 import pymupdf
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi.responses import Response
 
 from api.auth import verify_api_key
 from api.config import settings
@@ -277,3 +281,457 @@ async def extract_pages(
         "extracted_pages": len(result["pages"]),
         "pages": result["pages"],
     }
+
+
+# ── Redaction ────────────────────────────────────────────────────────────────
+#
+# True PDF redaction using PyMuPDF's add_redact_annot + apply_redactions.
+# Text is permanently removed from the content stream, not just visually
+# covered. For image-only pages, OCR via Tesseract locates text positions,
+# then black rectangles are drawn directly on the rendered pixmap.
+#
+# Strategies (applied per page in order):
+#   1. Image-only pages → OCR-based pixel redaction
+#   2. search_for()     → direct text-layer match (handles simple spans)
+#   3. Word-level       → get_text("words") grouped by line (handles fragmented spans)
+#   4. Link annotations → mailto:, tel:, social URLs in PDF link objects
+#   5. QR code images   → small square images in the contact area
+# ─────────────────────────────────────────────────────────────────────────────
+
+# -- Patterns ------------------------------------------------------------------
+
+_REDACT_PATTERNS: dict[str, re.Pattern] = {
+    # Email
+    "email": re.compile(
+        r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b", re.I,
+    ),
+    "email_fuzzy": re.compile(
+        r"[A-Za-z0-9._%+\-]+[\s(]*@[\s)]*[A-Za-z0-9.\-\u00C0-\u024F]+"
+        r"(?:\.(?:com|net|org|vn|io|co|edu|gov)\b"
+        r"|gm[a\u00E0\u00E1\u1EA3\u00E3\u1EA1]il\.?\w*"
+        r"|yahoo\.?\w*|outlook\.?\w*|hotmail\.?\w*)",
+        re.I,
+    ),
+    "email_at_line": re.compile(r"\S+@\S+", re.I),
+    # Phone – Vietnamese
+    "phone": re.compile(r"(?<!\d)(?:\+84|0084|84|0)[235789]\d{8}(?!\d)"),
+    "phone_spaced": re.compile(r"(?<!\d)0[235789]\d{1,2}[\s.\-]\d{3,4}[\s.\-]\d{3,4}(?!\d)"),
+    "phone_vn_paren": re.compile(r"\(\+?84\)[\s.\-]?\d[\d\s.\-]{7,12}\d(?!\d)"),
+    "phone_dot": re.compile(r"(?<!\d)0[235789]\d{1,2}\.\d{3}\.\d{3,4}(?!\d)"),
+    # Phone – international
+    "phone_intl": re.compile(r"(?<!\d)\+\d{1,3}[\s.\-]?\(?\d{2,4}\)?[\s.\-]?\d{3,4}[\s.\-]?\d{3,4}(?!\d)"),
+    # Social / professional URLs
+    "linkedin": re.compile(r"(?:https?://)?(?:www\.)?linkedin\.com/(?:in|pub|company)/[\w\-%]+/?", re.I),
+    "facebook": re.compile(r"(?:https?://)?(?:www\.)?(?:fb|facebook)\.com/[\w.\-/]+", re.I),
+    "github": re.compile(r"(?:https?://)?(?:www\.)?github\.com/[\w\-]+(?:/[\w\-.]+)*/?", re.I),
+    "twitter": re.compile(r"(?:https?://)?(?:www\.)?(?:twitter|x)\.com/\w{1,50}/?", re.I),
+    "instagram": re.compile(r"(?:https?://)?(?:www\.)?instagram\.com/[\w.\-]+/?", re.I),
+    "telegram": re.compile(r"(?:https?://)?t\.me/\w{3,50}/?", re.I),
+    "zalo": re.compile(r"zalo[:\s./]?\s*[\d\s\-]{9,15}", re.I),
+    "behance": re.compile(r"(?:https?://)?(?:www\.)?behance\.net/[\w\-]+/?", re.I),
+    "url_personal": re.compile(
+        r"(?:https?://)?(?:www\.)?(?:about\.me|portfolio|dribbble\.com|medium\.com)/[\w\-]+/?", re.I,
+    ),
+}
+
+_TARGET_GROUPS: dict[str, list[str]] = {
+    "email": ["email", "email_fuzzy", "email_at_line"],
+    "phone": ["phone", "phone_spaced", "phone_vn_paren", "phone_intl", "phone_dot"],
+    "linkedin": ["linkedin"],
+    "social": ["facebook", "github", "twitter", "instagram", "telegram", "zalo", "behance", "url_personal"],
+    "all": list(_REDACT_PATTERNS.keys()),
+}
+
+# -- Helpers -------------------------------------------------------------------
+
+_RECT_PAD = pymupdf.Rect(-2, -1, 2, 1)
+_RECT_PAD_IMG = 4
+_QR_MAX_SIZE = 200
+_QR_MIN_SIZE = 15
+_QR_ASPECT_THRESHOLD = 0.75
+_OCR_REDACT_DPI = 300
+
+
+def _resolve_targets(targets: list[str]) -> dict[str, re.Pattern]:
+    """Map user-facing target names (email, phone, …) to compiled patterns."""
+    keys: set[str] = set()
+    for t in targets:
+        name = t.strip().lower()
+        if name in _TARGET_GROUPS:
+            keys.update(_TARGET_GROUPS[name])
+        elif name in _REDACT_PATTERNS:
+            keys.add(name)
+    return {k: _REDACT_PATTERNS[k] for k in keys}
+
+
+def _rect_key(rect: pymupdf.Rect) -> tuple[int, int, int, int]:
+    """Rounded rect coordinates as hashable key for dedup."""
+    return (round(rect.x0), round(rect.y0), round(rect.x1), round(rect.y1))
+
+
+# -- Core redaction ------------------------------------------------------------
+
+
+class _PageRedactor:
+    """Handles redaction for a single PDF page."""
+
+    def __init__(self, page: pymupdf.Page, page_num: int,
+                 patterns: dict[str, re.Pattern], fill: tuple,
+                 seen: set[tuple]):
+        self.page = page
+        self.page_num = page_num
+        self.patterns = patterns
+        self.fill = fill
+        self.seen = seen
+        self.stats: dict[str, int] = {}
+        self.count = 0
+
+    def _mark(self, rect: pymupdf.Rect, label: str, pad: pymupdf.Rect = _RECT_PAD) -> bool:
+        """Add a redaction annotation if not already seen. Returns True if added."""
+        rk = _rect_key(rect)
+        if (self.page_num, label, rk) in self.seen:
+            return False
+        self.seen.add((self.page_num, label, rk))
+        self.page.add_redact_annot(rect + pad, fill=self.fill)
+        self.count += 1
+        self.stats[label] = self.stats.get(label, 0) + 1
+        return True
+
+    # ── Strategy 1: search_for() on full regex matches ───────────────────────
+
+    def redact_via_search(self, page_text: str) -> None:
+        for label, pattern in self.patterns.items():
+            for match in pattern.finditer(page_text):
+                hit = match.group(0).strip()
+                if len(hit) < 4:
+                    continue
+                for rect in self.page.search_for(hit):
+                    self._mark(rect, label)
+
+    # ── Strategy 2: word-level fallback for fragmented text ──────────────────
+
+    def redact_via_words(self) -> None:
+        words = self.page.get_text("words")
+        if not words:
+            return
+        # Group words into lines by (block_no, line_no)
+        lines: dict[tuple, list] = defaultdict(list)
+        for w in words:
+            lines[(w[5], w[6])].append(w)
+
+        for key in sorted(lines):
+            line_words = sorted(lines[key], key=lambda w: w[0])
+            line_text = " ".join(w[4] for w in line_words)
+
+            for label, pattern in self.patterns.items():
+                for match in pattern.finditer(line_text):
+                    m_start, m_end = match.start(), match.end()
+                    pos = 0
+                    for w in line_words:
+                        w_start, w_end = pos, pos + len(w[4])
+                        if w_end > m_start and w_start < m_end:
+                            self._mark(pymupdf.Rect(w[0], w[1], w[2], w[3]), label)
+                        pos = w_end + 1  # +1 for the join space
+
+    # ── Strategy 3: link annotations ─────────────────────────────────────────
+
+    def redact_links(self) -> None:
+        link = self.page.first_link
+        while link:
+            uri = link.uri or ""
+            matched_label = self._match_uri(uri)
+            if matched_label and link.rect.is_valid and not link.rect.is_empty:
+                self._mark(link.rect, matched_label, pad=pymupdf.Rect(0, 0, 0, 0))
+            link = link.next
+
+    def _match_uri(self, uri: str) -> str | None:
+        if not uri:
+            return None
+        for label, pattern in self.patterns.items():
+            if pattern.search(uri):
+                return label
+        if uri.startswith("mailto:"):
+            return "email"
+        if uri.startswith("tel:"):
+            return "phone"
+        return None
+
+    # ── Strategy 4: QR code images ───────────────────────────────────────────
+
+    def redact_qr_images(self) -> None:
+        try:
+            images = self.page.get_images(full=True)
+        except Exception:
+            return
+
+        page_height = self.page.rect.height
+        for img_info in images:
+            xref = img_info[0]
+            try:
+                rects = self.page.get_image_rects(xref)
+            except Exception:
+                continue
+            for rect in rects:
+                if not self._looks_like_qr(rect, page_height):
+                    continue
+                if self._try_decode_qr(xref, rect):
+                    continue
+                # Heuristic: small square image in top 40% → likely QR
+                if rect.y0 < page_height * 0.4 and max(rect.width, rect.height) < 150:
+                    self._mark(rect, "qr_code", pad=pymupdf.Rect(-3, -3, 3, 3))
+
+    def _looks_like_qr(self, rect: pymupdf.Rect, page_height: float) -> bool:
+        if rect.is_empty or not rect.is_valid:
+            return False
+        w, h = rect.width, rect.height
+        if w < _QR_MIN_SIZE or h < _QR_MIN_SIZE or max(w, h) > _QR_MAX_SIZE:
+            return False
+        return min(w, h) / max(w, h) >= _QR_ASPECT_THRESHOLD
+
+    def _try_decode_qr(self, xref: int, rect: pymupdf.Rect) -> bool:
+        """Try pyzbar decode. Returns True if QR was found and redacted."""
+        try:
+            from pyzbar.pyzbar import decode as qr_decode
+            from PIL import Image
+            pix = pymupdf.Pixmap(self.page.parent, xref)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            if qr_decode(img):
+                self._mark(rect, "qr_code", pad=pymupdf.Rect(-3, -3, 3, 3))
+                return True
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        return False
+
+    # ── Strategy 5: OCR-based redaction for image-only pages ─────────────────
+
+    def redact_image_page(self) -> bool:
+        """OCR the page, find contact info, draw black rects on the pixmap,
+        then replace the page content with the redacted image.
+        Returns True if any redactions were applied."""
+        pix = self.page.get_pixmap(dpi=_OCR_REDACT_DPI)
+
+        ocr_words = self._ocr_to_words(pix.tobytes("png"))
+        if not ocr_words:
+            return False
+
+        rects = self._match_ocr_words(ocr_words)
+        if not rects:
+            return False
+
+        # Draw on pixmap
+        fill_val = (0, 0, 0) if self.fill == (0, 0, 0) else (255, 255, 255)
+        for x0, y0, x1, y1, label in rects:
+            irect = pymupdf.IRect(
+                max(0, x0 - _RECT_PAD_IMG),
+                max(0, y0 - _RECT_PAD_IMG),
+                min(pix.width, x1 + _RECT_PAD_IMG),
+                min(pix.height, y1 + _RECT_PAD_IMG),
+            )
+            pix.set_rect(irect, fill_val)
+            self.count += 1
+            self.stats[label] = self.stats.get(label, 0) + 1
+
+        # Replace page content
+        self.page.clean_contents()
+        self.page.parent.update_stream(self.page.xref, b"")
+        self.page.insert_image(self.page.rect, stream=pix.tobytes("png"))
+        return True
+
+    def _ocr_to_words(self, img_bytes: bytes) -> list[dict]:
+        """Run Tesseract TSV and parse into word dicts with bounding boxes."""
+        fd, img_path = tempfile.mkstemp(suffix=".png")
+        tsv_base = img_path.replace(".png", "_ocr")
+        tsv_file = tsv_base + ".tsv"
+        try:
+            os.write(fd, img_bytes)
+            os.close(fd)
+            result = subprocess.run(
+                ["tesseract", img_path, tsv_base, "-l", OCR_LANGUAGES, "--psm", "3", "tsv"],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode != 0 or not os.path.exists(tsv_file):
+                return []
+
+            words = []
+            with open(tsv_file) as f:
+                f.readline()  # skip header
+                for line in f:
+                    parts = line.strip().split("\t")
+                    if len(parts) < 12:
+                        continue
+                    text = parts[11].strip()
+                    try:
+                        conf = float(parts[10])
+                    except (ValueError, IndexError):
+                        continue
+                    if not text or conf < 0:
+                        continue
+                    try:
+                        words.append({
+                            "text": text,
+                            "left": int(parts[6]), "top": int(parts[7]),
+                            "width": int(parts[8]), "height": int(parts[9]),
+                            "line": int(parts[4]), "block": int(parts[2]),
+                        })
+                    except (ValueError, IndexError):
+                        continue
+            return words
+        except Exception:
+            return []
+        finally:
+            for p in (img_path, tsv_file):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+    def _match_ocr_words(self, words: list[dict]) -> list[tuple]:
+        """Group OCR words into lines, match patterns, return redact rects."""
+        lines: dict[tuple, list] = defaultdict(list)
+        for w in words:
+            lines[(w["block"], w["line"])].append(w)
+
+        rects = []
+        for key in sorted(lines):
+            line_words = sorted(lines[key], key=lambda w: w["left"])
+            line_text = " ".join(w["text"] for w in line_words)
+
+            for label, pattern in self.patterns.items():
+                for match in pattern.finditer(line_text):
+                    m_start, m_end = match.start(), match.end()
+                    pos = 0
+                    for w in line_words:
+                        w_start, w_end = pos, pos + len(w["text"])
+                        if w_end > m_start and w_start < m_end:
+                            rects.append((
+                                w["left"], w["top"],
+                                w["left"] + w["width"], w["top"] + w["height"],
+                                label,
+                            ))
+                        pos = w_end + 1
+        return rects
+
+    # ── Apply ────────────────────────────────────────────────────────────────
+
+    def apply(self) -> None:
+        """Commit all pending redaction annotations on this page."""
+        self.page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_PIXELS, graphics=True)
+
+
+# -- Document-level orchestration ----------------------------------------------
+
+
+def _redact_document(file_bytes: bytes, filename: str,
+                     targets: list[str], fill_color_name: str) -> tuple[bytes, dict]:
+    """Redact contact information from a PDF document. Runs in thread pool."""
+    ext = _ext_from_filename(filename)
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise ValueError(f"Unsupported file type: {ext or 'unknown'}")
+
+    fill = (0, 0, 0) if fill_color_name == "black" else (1, 1, 1)
+    patterns = _resolve_targets(targets)
+    if not patterns:
+        raise ValueError(f"No valid redaction targets. Available: {list(_TARGET_GROUPS.keys())}")
+
+    try:
+        doc = pymupdf.open(stream=file_bytes, filetype=ext.lstrip("."))
+    except Exception as exc:
+        raise ValueError(f"Failed to open document: {exc}")
+
+    total_stats: dict[str, int] = {}
+    total_count = 0
+    seen: set[tuple] = set()
+
+    try:
+        for page_num, page in enumerate(doc):
+            r = _PageRedactor(page, page_num, patterns, fill, seen)
+            page_text = page.get_text("text")
+
+            if len(page_text.strip()) < TEXT_THRESHOLD:
+                # Image-only page → OCR path
+                r.redact_image_page()
+            else:
+                # Text-based page → layered strategies
+                r.redact_via_search(page_text)
+                r.redact_via_words()
+                r.redact_links()
+                r.redact_qr_images()
+                r.apply()
+
+            total_count += r.count
+            for k, v in r.stats.items():
+                total_stats[k] = total_stats.get(k, 0) + v
+
+        buf = io.BytesIO()
+        doc.save(buf, deflate=True, garbage=4)
+        return buf.getvalue(), {"total_redactions": total_count, "details": total_stats}
+    finally:
+        doc.close()
+
+
+def _verify_redaction(redacted_bytes: bytes, patterns: dict[str, re.Pattern]) -> list[str]:
+    """Re-extract text from the redacted PDF and check for remaining PII."""
+    warnings = []
+    try:
+        doc = pymupdf.open(stream=redacted_bytes, filetype="pdf")
+        full_text = "\n".join(page.get_text("text") for page in doc)
+        doc.close()
+        for label, pattern in patterns.items():
+            n = len(pattern.findall(full_text))
+            if n:
+                warnings.append(f"{label}: {n} match(es) still found")
+    except Exception:
+        pass
+    return warnings
+
+
+# -- Endpoint ------------------------------------------------------------------
+
+
+@app.post("/redact")
+async def redact(
+    file: UploadFile = File(None),
+    url: str = Form(None),
+    targets: str = Form(
+        "email,phone,linkedin,social",
+        description="Comma-separated: email, phone, linkedin, social, all",
+    ),
+    fill_color: str = Form("black", description="Redaction fill: 'black' or 'white'"),
+    verify: bool = Form(True, description="Verify no PII remains after redaction"),
+    _key: str = Depends(verify_api_key),
+):
+    """Redact contact information from a PDF document.
+
+    Permanently removes email, phone, LinkedIn, and social-media URLs from
+    both the text layer and image layer (for scanned/image-only PDFs).
+
+    Returns the redacted PDF as a binary download.
+    """
+    content, filename = await _resolve_input(file, url)
+    target_list = [t.strip() for t in targets.split(",") if t.strip()]
+
+    loop = asyncio.get_event_loop()
+    try:
+        redacted_bytes, stats = await loop.run_in_executor(
+            _pool, _redact_document, content, filename, target_list, fill_color,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+
+    warnings: list[str] = []
+    if verify and stats["total_redactions"] > 0:
+        active = _resolve_targets(target_list)
+        warnings = await loop.run_in_executor(_pool, _verify_redaction, redacted_bytes, active)
+
+    return Response(
+        content=redacted_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="redacted_{filename}"',
+            "X-Redaction-Count": str(stats["total_redactions"]),
+            "X-Redaction-Details": str(stats["details"]),
+            "X-Redaction-Warnings": str(warnings) if warnings else "none",
+        },
+    )
