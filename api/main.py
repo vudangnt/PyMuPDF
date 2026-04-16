@@ -616,8 +616,57 @@ class _PageRedactor:
     # ── Apply ────────────────────────────────────────────────────────────────
 
     def apply(self) -> None:
-        """Commit all pending redaction annotations on this page."""
-        self.page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_PIXELS, graphics=True)
+        """Commit all pending redaction annotations on this page.
+        images=PDF_REDACT_IMAGE_NONE to preserve personal photos/avatars."""
+        self.page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE, graphics=True)
+
+    # ── Strategy 6: OCR text-in-image spans (e.g. email rendered as image) ───
+
+    def redact_text_images(self) -> None:
+        """Find small images in the contact/header area that contain text
+        (email, phone, etc.) rendered as images instead of text layer.
+        OCR each candidate image and redact if PII is found."""
+        try:
+            images = self.page.get_images(full=True)
+        except Exception:
+            return
+
+        page_height = self.page.rect.height
+        for img_info in images:
+            xref = img_info[0]
+            try:
+                rects = self.page.get_image_rects(xref)
+            except Exception:
+                continue
+            for rect in rects:
+                if not rect.is_valid or rect.is_empty:
+                    continue
+                w, h = rect.width, rect.height
+                # Skip large images (photos/backgrounds) and tiny icons
+                if w < 30 or h < 8 or h > 60 or w > 500:
+                    continue
+                # Only top 30% of page (contact/header area)
+                if rect.y0 > page_height * 0.3:
+                    continue
+                # Aspect ratio: text images are wide, not square (skip QR/icons)
+                if w / h < 2.0:
+                    continue
+                # OCR this image
+                try:
+                    pix = pymupdf.Pixmap(self.page.parent, xref)
+                    if pix.width < 20 or pix.height < 8:
+                        continue
+                    img_bytes = pix.tobytes("png")
+                    ocr_text = _ocr_page_subprocess(img_bytes, OCR_LANGUAGES)
+                    if not ocr_text.strip():
+                        continue
+                    # Check if OCR text matches any pattern
+                    for label, pattern in self.patterns.items():
+                        if pattern.search(ocr_text):
+                            self._mark(rect, label, pad=pymupdf.Rect(-2, -2, 2, 2))
+                            break
+                except Exception:
+                    continue
 
 
 # -- Document-level orchestration ----------------------------------------------
@@ -658,6 +707,7 @@ def _redact_document(file_bytes: bytes, filename: str,
                 r.redact_via_words()
                 r.redact_links()
                 r.redact_qr_images()
+                r.redact_text_images()
                 r.apply()
 
             total_count += r.count
