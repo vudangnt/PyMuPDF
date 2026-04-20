@@ -332,13 +332,26 @@ _REDACT_PATTERNS: dict[str, re.Pattern] = {
     "url_personal": re.compile(
         r"(?:https?://)?(?:www\.)?(?:about\.me|portfolio|dribbble\.com|medium\.com)/[\w\-]+/?", re.I,
     ),
+    # Portfolio-style subdomain (e.g. portfolio-shindo806.vercel.app, my-portfolio.netlify.app)
+    "portfolio_subdomain": re.compile(
+        r"(?:https?://)?(?:www\.)?portfolio[\w\-]*\.[\w\-.]+(?:/\S*)?", re.I,
+    ),
+    # Free hosting / no-code portfolio domains
+    "portfolio_hosting": re.compile(
+        r"(?:https?://)?(?:[\w\-]+\.)+(?:vercel\.app|netlify\.app|github\.io|my\.canva\.site|canva\.site|notion\.site|webflow\.io|pages\.dev|framer\.website|glitch\.me|replit\.app|surge\.sh)(?:/\S*)?",
+        re.I,
+    ),
+    # Canva design links
+    "canva_design": re.compile(
+        r"(?:https?://)?(?:www\.)?canva\.com/design/[\w\-/]+", re.I,
+    ),
 }
 
 _TARGET_GROUPS: dict[str, list[str]] = {
     "email": ["email", "email_fuzzy", "email_at_line"],
     "phone": ["phone", "phone_spaced", "phone_vn_paren", "phone_intl", "phone_dot"],
     "linkedin": ["linkedin"],
-    "social": ["facebook", "github", "twitter", "instagram", "telegram", "zalo", "behance", "url_personal"],
+    "social": ["facebook", "github", "twitter", "instagram", "telegram", "zalo", "behance", "url_personal", "portfolio_subdomain", "portfolio_hosting", "canva_design"],
     "all": list(_REDACT_PATTERNS.keys()),
 }
 
