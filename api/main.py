@@ -487,11 +487,12 @@ class _PageRedactor:
             for rect in rects:
                 if not self._looks_like_qr(rect, page_height):
                     continue
-                if self._try_decode_qr(xref, rect):
-                    continue
-                # Heuristic: small square image in top 40% → likely QR
-                if rect.y0 < page_height * 0.4 and max(rect.width, rect.height) < 150:
-                    self._mark(rect, "qr_code", pad=pymupdf.Rect(-3, -3, 3, 3))
+                # Only redact if pyzbar actually decodes a QR payload.
+                # Previously a fallback heuristic (small square in top 40%)
+                # also marked as QR, but it matched candidate avatar/photo
+                # on CVs and wiped the portrait. No heuristic fallback:
+                # if pyzbar can't decode, treat it as a normal image.
+                self._try_decode_qr(xref, rect)
 
     def _looks_like_qr(self, rect: pymupdf.Rect, page_height: float) -> bool:
         if rect.is_empty or not rect.is_valid:
