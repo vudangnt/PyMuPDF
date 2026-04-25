@@ -26,7 +26,7 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-_pool = ThreadPoolExecutor(max_workers=2)
+_pool = ThreadPoolExecutor(max_workers=1)
 
 SUPPORTED_EXTENSIONS = {
     ".pdf", ".epub", ".xps", ".fb2", ".cbz", ".svg",
@@ -759,7 +759,7 @@ def _redact_document(file_bytes: bytes, filename: str,
                 total_stats[k] = total_stats.get(k, 0) + v
 
         buf = io.BytesIO()
-        doc.save(buf, deflate=True, garbage=4)
+        doc.save(buf, deflate=True, garbage=2)
         return buf.getvalue(), {"total_redactions": total_count, "details": total_stats}
     finally:
         doc.close()
