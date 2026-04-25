@@ -26,7 +26,7 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-_pool = ThreadPoolExecutor(max_workers=4)
+_pool = ThreadPoolExecutor(max_workers=2)
 
 SUPPORTED_EXTENSIONS = {
     ".pdf", ".epub", ".xps", ".fb2", ".cbz", ".svg",
@@ -362,7 +362,7 @@ _RECT_PAD_IMG = 4
 _QR_MAX_SIZE = 200
 _QR_MIN_SIZE = 15
 _QR_ASPECT_THRESHOLD = 0.75
-_OCR_REDACT_DPI = 300
+_OCR_REDACT_DPI = 150
 
 
 def _resolve_targets(targets: list[str]) -> dict[str, re.Pattern]:
@@ -524,7 +524,17 @@ class _PageRedactor:
         """OCR the page, find contact info, draw black rects on the pixmap,
         then replace the page content with the redacted image.
         Returns True if any redactions were applied."""
-        pix = self.page.get_pixmap(dpi=_OCR_REDACT_DPI)
+        # Cap DPI so pixmap stays under ~8MP to avoid OOM with large scans.
+        page_rect = self.page.rect
+        max_pixels = 8_000_000
+        natural_w = page_rect.width * _OCR_REDACT_DPI / 72
+        natural_h = page_rect.height * _OCR_REDACT_DPI / 72
+        if natural_w * natural_h > max_pixels:
+            scale = (max_pixels / (natural_w * natural_h)) ** 0.5
+            dpi = max(72, int(_OCR_REDACT_DPI * scale))
+        else:
+            dpi = _OCR_REDACT_DPI
+        pix = self.page.get_pixmap(dpi=dpi)
 
         ocr_words = self._ocr_to_words(pix.tobytes("png"))
         if not ocr_words:
@@ -534,7 +544,7 @@ class _PageRedactor:
         if not rects:
             return False
 
-        # Draw on pixmap
+        # Draw black/white blocks directly on the pixmap
         fill_val = (0, 0, 0) if self.fill == (0, 0, 0) else (255, 255, 255)
         for x0, y0, x1, y1, label in rects:
             irect = pymupdf.IRect(
@@ -547,10 +557,14 @@ class _PageRedactor:
             self.count += 1
             self.stats[label] = self.stats.get(label, 0) + 1
 
-        # Replace page content
-        self.page.clean_contents()
-        self.page.parent.update_stream(self.page.xref, b"")
-        self.page.insert_image(self.page.rect, stream=pix.tobytes("png"))
+        # Replace page content: draw a white background then overlay the redacted pixmap.
+        # Avoids update_stream(xref, b"") which can corrupt PDF docs converted from images.
+        page_rect = self.page.rect
+        shape = self.page.new_shape()
+        shape.draw_rect(page_rect)
+        shape.finish(fill=(1, 1, 1), color=None, width=0)
+        shape.commit()
+        self.page.insert_image(page_rect, stream=pix.tobytes("png"), overlay=True)
         return True
 
     def _ocr_to_words(self, img_bytes: bytes) -> list[dict]:
@@ -686,6 +700,9 @@ class _PageRedactor:
 # -- Document-level orchestration ----------------------------------------------
 
 
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"}
+
+
 def _redact_document(file_bytes: bytes, filename: str,
                      targets: list[str], fill_color_name: str) -> tuple[bytes, dict]:
     """Redact contact information from a PDF document. Runs in thread pool."""
@@ -697,6 +714,19 @@ def _redact_document(file_bytes: bytes, filename: str,
     patterns = _resolve_targets(targets)
     if not patterns:
         raise ValueError(f"No valid redaction targets. Available: {list(_TARGET_GROUPS.keys())}")
+
+    # Images must be converted to PDF first — opening as image doc causes segfault
+    # in clean_contents() when redact_image_page tries to replace page content.
+    if ext in _IMAGE_EXTENSIONS:
+        try:
+            img_doc = pymupdf.open(stream=file_bytes, filetype=ext.lstrip("."))
+            pdf_bytes = img_doc.convert_to_pdf()
+            img_doc.close()
+            file_bytes = pdf_bytes
+            filename = filename.rsplit(".", 1)[0] + ".pdf"
+            ext = ".pdf"
+        except Exception as exc:
+            raise ValueError(f"Failed to convert image to PDF: {exc}")
 
     try:
         doc = pymupdf.open(stream=file_bytes, filetype=ext.lstrip("."))
