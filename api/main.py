@@ -703,10 +703,32 @@ class _PageRedactor:
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"}
 
 
+_MAGIC_BYTES: list[tuple[bytes, str]] = [
+    (b"\x89PNG", ".png"),
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"GIF8", ".gif"),
+    (b"BM", ".bmp"),
+    (b"II\x2a\x00", ".tiff"),
+    (b"MM\x00\x2a", ".tiff"),
+    (b"%PDF", ".pdf"),
+]
+
+
+def _detect_ext(file_bytes: bytes) -> str | None:
+    for magic, ext in _MAGIC_BYTES:
+        if file_bytes[:len(magic)] == magic:
+            return ext
+    return None
+
+
 def _redact_document(file_bytes: bytes, filename: str,
                      targets: list[str], fill_color_name: str) -> tuple[bytes, dict]:
     """Redact contact information from a PDF document. Runs in thread pool."""
     ext = _ext_from_filename(filename)
+    # Override extension when magic bytes disagree — prevents sending PNG with .pdf filename
+    detected = _detect_ext(file_bytes)
+    if detected and detected != ext:
+        ext = detected
     if ext not in SUPPORTED_EXTENSIONS:
         raise ValueError(f"Unsupported file type: {ext or 'unknown'}")
 
