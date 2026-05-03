@@ -318,8 +318,10 @@ _REDACT_PATTERNS: dict[str, re.Pattern] = {
     "phone_spaced": re.compile(r"(?<!\d)0[235789]\d{1,2}[\s.\-]\d{3,4}[\s.\-]\d{3,4}(?!\d)"),
     "phone_vn_paren": re.compile(r"\(\+?84\)[\s.\-]?\d[\d\s.\-]{7,12}\d(?!\d)"),
     "phone_dot": re.compile(r"(?<!\d)0[235789]\d{1,2}\.\d{3}\.\d{3,4}(?!\d)"),
+    # +84 with flexible spacing: +84 3558 72 558, +84 935 887 255, +84-935-887-255
+    "phone_84_spaced": re.compile(r"(?<!\d)\+84[\s.\-]?\d(?:[\s.\-]?\d){8}(?!\d)"),
     # Phone – international
-    "phone_intl": re.compile(r"(?<!\d)\+\d{1,3}[\s.\-]?\(?\d{2,4}\)?[\s.\-]?\d{3,4}[\s.\-]?\d{3,4}(?!\d)"),
+    "phone_intl": re.compile(r"(?<!\d)\+\d{1,3}[\s.\-]?\(?\d{1,4}\)?[\s.\-]?\d{2,4}[\s.\-]?\d{2,4}(?:[\s.\-]?\d{1,4})?(?!\d)"),
     # Social / professional URLs
     "linkedin": re.compile(r"(?:https?://)?(?:www\.)?linkedin\.com/(?:in|pub|company)/[\w\-%]+/?", re.I),
     "facebook": re.compile(r"(?:https?://)?(?:www\.)?(?:fb|facebook)\.com/[\w.\-/]+", re.I),
@@ -349,7 +351,7 @@ _REDACT_PATTERNS: dict[str, re.Pattern] = {
 
 _TARGET_GROUPS: dict[str, list[str]] = {
     "email": ["email", "email_fuzzy", "email_at_line"],
-    "phone": ["phone", "phone_spaced", "phone_vn_paren", "phone_intl", "phone_dot"],
+    "phone": ["phone", "phone_spaced", "phone_vn_paren", "phone_intl", "phone_dot", "phone_84_spaced"],
     "linkedin": ["linkedin"],
     "social": ["facebook", "github", "twitter", "instagram", "telegram", "zalo", "behance", "url_personal", "portfolio_subdomain", "portfolio_hosting", "canva_design"],
     "all": list(_REDACT_PATTERNS.keys()),
