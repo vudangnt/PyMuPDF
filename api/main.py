@@ -326,11 +326,13 @@ _REDACT_PATTERNS: dict[str, re.Pattern] = {
     "phone_one_sep": re.compile(r"(?<!\d)0\d{1,4}[\s.\-]\d{6,8}(?!\d)"),
     # Paired-group forms: 0908.25.05.88, 090.825.05.88, 0908 25 05 88
     "phone_pairs": re.compile(r"(?<!\d)0\d{0,4}[\s.\-]\d{2,3}[\s.\-]\d{2}[\s.\-]\d{2,4}(?!\d)"),
-    # +84 with flexible spacing: +84 3558 72 558, +84-935-887-255, +84 1663456789
-    "phone_84_spaced": re.compile(r"(?<!\d)\+84[\s.\-]?\d(?:[\s.\-]?\d){8,9}(?!\d)"),
-    # Catch-all safety net: 10-11 digits starting with 0, any [\s.\-] separators between.
-    # Covers exotic groupings like `09 08 25 05 88` that don't fit the above templates.
-    "phone_loose": re.compile(r"(?<!\d)0(?:[\s.\-]?\d){9,10}(?!\d)"),
+    # +84 with flexible spacing: +84 908 250 588, +84-935-887-255, +84 . 908 . 250 588.
+    # Up to 3 separator chars between any two digits to cover mixed/double spacing.
+    "phone_84_spaced": re.compile(r"(?<!\d)\+84[\s.\-]{0,3}\d(?:[\s.\-]{0,3}\d){8,9}(?!\d)"),
+    # Catch-all safety net: 10-11 digits starting with 0, with 0-3 separator chars between
+    # any two digits. Covers exotic groupings like `09 08 25 05 88`, `0908 - 250588`,
+    # `0908..250588`, and any combination of `.`, space, `-` anywhere in the number.
+    "phone_loose": re.compile(r"(?<!\d)0(?:[\s.\-]{0,3}\d){9,10}(?!\d)"),
     # Phone – international
     "phone_intl": re.compile(r"(?<!\d)\+\d{1,3}[\s.\-]?\(?\d{1,4}\)?[\s.\-]?\d{2,4}[\s.\-]?\d{2,4}(?:[\s.\-]?\d{1,4})?(?!\d)"),
     # Social / professional URLs
