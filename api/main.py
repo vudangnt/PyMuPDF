@@ -313,13 +313,24 @@ _REDACT_PATTERNS: dict[str, re.Pattern] = {
         re.I,
     ),
     "email_at_line": re.compile(r"\S+@\S+", re.I),
-    # Phone – Vietnamese
-    "phone": re.compile(r"(?<!\d)(?:\+84|0084|84|0)[235789]\d{8}(?!\d)"),
-    "phone_spaced": re.compile(r"(?<!\d)0[235789]\d{1,2}[\s.\-]\d{3,4}[\s.\-]\d{3,4}(?!\d)"),
-    "phone_vn_paren": re.compile(r"\(\+?84\)[\s.\-]?\d[\d\s.\-]{7,12}\d(?!\d)"),
-    "phone_dot": re.compile(r"(?<!\d)0[235789]\d{1,2}\.\d{3}\.\d{3,4}(?!\d)"),
-    # +84 with flexible spacing: +84 3558 72 558, +84 935 887 255, +84-935-887-255
-    "phone_84_spaced": re.compile(r"(?<!\d)\+84[\s.\-]?\d(?:[\s.\-]?\d){8}(?!\d)"),
+    # Phone – Vietnamese. Permissive on digits after the leading 0 to cover:
+    #   - modern mobile (03/05/07/08/09) and old prefixes (011/014/016/018/019) in legacy CVs
+    #   - 10-digit modern format and 11-digit pre-2018 format
+    #   - landlines (024 Hanoi, 028 HCMC, 02xx other cities)
+    # False-positive risk (any 10-11 digit zero-led code) is acceptable for redaction.
+    "phone": re.compile(r"(?<!\d)(?:\+84|0084|84|0)\d{9,10}(?!\d)"),
+    "phone_spaced": re.compile(r"(?<!\d)0\d{1,4}[\s.\-]\d{3,4}[\s.\-]\d{3,4}(?!\d)"),
+    "phone_vn_paren": re.compile(r"\(\+?84\)[\s.\-]?\d[\d\s.\-]{7,13}\d(?!\d)"),
+    "phone_dot": re.compile(r"(?<!\d)0\d{1,4}\.\d{3}\.\d{3,4}(?!\d)"),
+    # Single-separator forms: 0908.250588, 0908 250588, 0908-250588, 01663.456789
+    "phone_one_sep": re.compile(r"(?<!\d)0\d{1,4}[\s.\-]\d{6,8}(?!\d)"),
+    # Paired-group forms: 0908.25.05.88, 090.825.05.88, 0908 25 05 88
+    "phone_pairs": re.compile(r"(?<!\d)0\d{0,4}[\s.\-]\d{2,3}[\s.\-]\d{2}[\s.\-]\d{2,4}(?!\d)"),
+    # +84 with flexible spacing: +84 3558 72 558, +84-935-887-255, +84 1663456789
+    "phone_84_spaced": re.compile(r"(?<!\d)\+84[\s.\-]?\d(?:[\s.\-]?\d){8,9}(?!\d)"),
+    # Catch-all safety net: 10-11 digits starting with 0, any [\s.\-] separators between.
+    # Covers exotic groupings like `09 08 25 05 88` that don't fit the above templates.
+    "phone_loose": re.compile(r"(?<!\d)0(?:[\s.\-]?\d){9,10}(?!\d)"),
     # Phone – international
     "phone_intl": re.compile(r"(?<!\d)\+\d{1,3}[\s.\-]?\(?\d{1,4}\)?[\s.\-]?\d{2,4}[\s.\-]?\d{2,4}(?:[\s.\-]?\d{1,4})?(?!\d)"),
     # Social / professional URLs
@@ -351,7 +362,7 @@ _REDACT_PATTERNS: dict[str, re.Pattern] = {
 
 _TARGET_GROUPS: dict[str, list[str]] = {
     "email": ["email", "email_fuzzy", "email_at_line"],
-    "phone": ["phone", "phone_spaced", "phone_vn_paren", "phone_intl", "phone_dot", "phone_84_spaced"],
+    "phone": ["phone", "phone_spaced", "phone_vn_paren", "phone_intl", "phone_dot", "phone_one_sep", "phone_pairs", "phone_84_spaced", "phone_loose"],
     "linkedin": ["linkedin"],
     "social": ["facebook", "github", "twitter", "instagram", "telegram", "zalo", "behance", "url_personal", "portfolio_subdomain", "portfolio_hosting", "canva_design"],
     "all": list(_REDACT_PATTERNS.keys()),
