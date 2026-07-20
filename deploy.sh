@@ -20,6 +20,7 @@ rsync -avz --progress \
   "root@222.255.148.172:$REMOTE_DIR/"
 
 echo "==> Installing dependencies..."
+$SSH "command -v dpkg >/dev/null && dpkg -s libzbar0 >/dev/null 2>&1 || apt-get install -y -q libzbar0"
 $SSH "cd $REMOTE_DIR && pip3 install -r api/requirements.txt -q"
 
 echo "==> Copying supervisor config..."

@@ -21,7 +21,7 @@ from api.config import settings
 app = FastAPI(
     title="PDF to Text API",
     description="Extract text from PDF and other documents using PyMuPDF (with OCR support)",
-    version="1.2.0",
+    version="1.3.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -212,6 +212,51 @@ async def _resolve_input(file: UploadFile | None, url: str | None) -> tuple[byte
         raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                             detail=f"File size exceeds {settings.MAX_FILE_SIZE_MB}MB limit")
     return content, file.filename or "document"
+
+
+def _render_thumbnail(file_bytes: bytes, filename: str, width: int) -> bytes:
+    """Render page 1 as a PNG thumbnail - runs in thread pool.
+
+    Dùng cho card talent-pool NR: input là CV ĐÃ REDACT (không đưa bản gốc vào
+    đây — trang 1 CV gốc chứa email/SĐT). Render theo width thay vì DPI cố định
+    để thumbnail nhẹ, không phụ thuộc khổ giấy.
+    """
+    ext = _ext_from_filename(filename)
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise ValueError(f"Unsupported file type: {ext or 'unknown'}")
+    try:
+        doc = pymupdf.open(stream=file_bytes, filetype=ext.lstrip("."))
+    except Exception as exc:
+        raise ValueError(f"Failed to open document: {exc}")
+    try:
+        if len(doc) == 0:
+            raise ValueError("Document has no pages")
+        page = doc[0]
+        page_width = page.rect.width or 1.0
+        zoom = max(0.1, min(width / page_width, 4.0))
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
+        return pix.tobytes("png")
+    finally:
+        doc.close()
+
+
+@app.post("/thumbnail")
+async def thumbnail(
+    file: UploadFile = File(None),
+    url: str = Form(None),
+    width: int = Form(480, ge=64, le=1600, description="Target pixel width of the PNG"),
+    _key: str = Depends(verify_api_key),
+):
+    """PNG thumbnail of page 1. Provide either `file` (upload) or `url`.
+    Returns raw image/png bytes."""
+    content, filename = await _resolve_input(file, url)
+    loop = asyncio.get_event_loop()
+    try:
+        png = await loop.run_in_executor(_pool, _render_thumbnail, content, filename, width)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    return Response(content=png, media_type="image/png",
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.post("/extract")

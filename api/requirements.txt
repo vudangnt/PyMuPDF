@@ -1,5 +1,10 @@
-fastapi>=0.111.0
-uvicorn[standard]>=0.29.0
-python-multipart>=0.0.9
-pydantic-settings>=2.2.0
-pymupdf>=1.24.0
+fastapi>=0.139.2
+uvicorn[standard]>=0.51.0
+python-multipart>=0.0.32
+pydantic-settings>=2.14.2
+pymupdf>=1.28.0
+# QR-code redaction (strategy 4). Without these, _try_decode_qr silently
+# no-ops (ImportError swallowed) and QR codes with contact info pass through.
+# pyzbar also needs the system lib: apt-get install libzbar0
+pyzbar>=0.1.9
+pillow>=12.0.0
