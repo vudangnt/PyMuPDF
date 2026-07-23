@@ -21,7 +21,7 @@ from api.config import settings
 app = FastAPI(
     title="PDF to Text API",
     description="Extract text from PDF and other documents using PyMuPDF (with OCR support)",
-    version="1.3.0",
+    version="1.3.1",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -382,6 +382,9 @@ _REDACT_PATTERNS: dict[str, re.Pattern] = {
     "phone_intl": re.compile(r"(?<!\d)\+\d{1,3}[\s.\-]?\(?\d{1,4}\)?[\s.\-]?\d{2,4}[\s.\-]?\d{2,4}(?:[\s.\-]?\d{1,4})?(?!\d)"),
     # Social / professional URLs
     "linkedin": re.compile(r"(?:https?://)?(?:www\.)?linkedin\.com/(?:in|pub|company)/[\w\-%]+/?", re.I),
+    # Bare/truncated linkedin URL (CV builders often wrap or cut the slug):
+    # "https://www.linkedin.com/" alone must still be redacted.
+    "linkedin_any": re.compile(r"(?:https?://)?(?:www\.)?linkedin\.com/?(?!\w)", re.I),
     "facebook": re.compile(r"(?:https?://)?(?:www\.)?(?:fb|facebook)\.com/[\w.\-/]+", re.I),
     "github": re.compile(r"(?:https?://)?(?:www\.)?github\.com/[\w\-]+(?:/[\w\-.]+)*/?", re.I),
     "twitter": re.compile(r"(?:https?://)?(?:www\.)?(?:twitter|x)\.com/\w{1,50}/?", re.I),
@@ -410,9 +413,28 @@ _REDACT_PATTERNS: dict[str, re.Pattern] = {
 _TARGET_GROUPS: dict[str, list[str]] = {
     "email": ["email", "email_fuzzy", "email_at_line"],
     "phone": ["phone", "phone_spaced", "phone_vn_paren", "phone_intl", "phone_dot", "phone_one_sep", "phone_pairs", "phone_84_spaced", "phone_loose"],
-    "linkedin": ["linkedin"],
+    "linkedin": ["linkedin", "linkedin_any"],
     "social": ["facebook", "github", "twitter", "instagram", "telegram", "zalo", "behance", "url_personal", "portfolio_subdomain", "portfolio_hosting", "canva_design"],
     "all": list(_REDACT_PATTERNS.keys()),
+}
+
+# Patterns for strategy 2b (block text concatenated WITHOUT separators, to
+# reassemble URLs split across spans/lines). Only bounded patterns: on
+# separator-less text the normal greedy forms (`[\w.\-/]+`, `\S+@\S+`, digit
+# runs) would swallow entire blocks, so continuations are length-capped and
+# phone/email_at_line are excluded entirely. Keys must match main pattern
+# names — a label only runs when its group was requested.
+_CONCAT_PATTERNS: dict[str, re.Pattern] = {
+    "email": _REDACT_PATTERNS["email"],
+    "linkedin": re.compile(
+        r"(?:https?://)?(?:www\.)?linkedin\.com(?:/(?:in|pub|company)/[\w\-%]{1,80})?/?", re.I,
+    ),
+    "facebook": re.compile(r"(?:https?://)?(?:www\.)?(?:fb|facebook)\.com/[\w.\-]{1,80}/?", re.I),
+    "github": re.compile(r"(?:https?://)?(?:www\.)?github\.com/[\w\-]{1,60}(?:/[\w\-.]{1,60}){0,3}/?", re.I),
+    "twitter": _REDACT_PATTERNS["twitter"],
+    "instagram": re.compile(r"(?:https?://)?(?:www\.)?instagram\.com/[\w.\-]{1,60}/?", re.I),
+    "telegram": _REDACT_PATTERNS["telegram"],
+    "behance": re.compile(r"(?:https?://)?(?:www\.)?behance\.net/[\w\-]{1,60}/?", re.I),
 }
 
 # -- Helpers -------------------------------------------------------------------
@@ -505,6 +527,64 @@ class _PageRedactor:
                         if w_end > m_start and w_start < m_end:
                             self._mark(pymupdf.Rect(w[0], w[1], w[2], w[3]), label)
                         pos = w_end + 1  # +1 for the join space
+
+    # ── Strategy 2b: block-level concat for URLs wrapped across spans/lines ──
+
+    def redact_via_word_concat(self) -> None:
+        """Reassemble URLs/emails that PDF generators split across text spans,
+        blocks or wrapped lines (e.g. `https://www.linkedin.com/` + `in/đ` +
+        `ậu-hằng-2402/` — the domain span can even sit in a different block
+        than its continuation). Words that are horizontally adjacent in the
+        same visual row are merged into tokens regardless of block; each
+        block's tokens are then concatenated with NO separator and matched
+        against the length-capped _CONCAT_PATTERNS."""
+        patterns = {k: p for k, p in _CONCAT_PATTERNS.items() if k in self.patterns}
+        if not patterns:
+            return
+        raw = self.page.get_text("words")
+        if not raw:
+            return
+
+        # Visual rows: chain words whose y0 differ <= 2pt (block-independent).
+        rows: list[list] = []
+        for w in sorted(raw, key=lambda w: (w[1], w[0])):
+            if rows and abs(w[1] - rows[-1][-1][1]) <= 2:
+                rows[-1].append(w)
+            else:
+                rows.append([w])
+
+        # Tokens: merge x-adjacent words (gap <= 4pt) within a row. A token
+        # remembers every block its member words came from. Words with no
+        # alphanumeric char at all (icon glyphs like U+F129, bullets) are
+        # dropped — a sidebar icon sitting between two fragments of a wrapped
+        # URL would otherwise cut the concatenated stream in half.
+        tokens: list[list] = []  # [text, [rects], {block_nos}, row_no, x0]
+        for row_no, row in enumerate(rows):
+            row.sort(key=lambda w: w[0])
+            for w in row:
+                if not any(ch.isalnum() for ch in w[4]):
+                    continue
+                rect = pymupdf.Rect(w[0], w[1], w[2], w[3])
+                if tokens and tokens[-1][3] == row_no and w[0] - tokens[-1][1][-1].x1 <= 4:
+                    tokens[-1][0] += w[4]
+                    tokens[-1][1].append(rect)
+                    tokens[-1][2].add(w[5])
+                else:
+                    tokens.append([w[4], [rect], {w[5]}, row_no, w[0]])
+
+        for bno in sorted({b for t in tokens for b in t[2]}):
+            stream = sorted((t for t in tokens if bno in t[2]), key=lambda t: (t[3], t[4]))
+            concat = "".join(t[0] for t in stream)
+
+            for label, pattern in patterns.items():
+                for match in pattern.finditer(concat):
+                    pos = 0
+                    for t in stream:
+                        t_start, t_end = pos, pos + len(t[0])
+                        if t_end > match.start() and t_start < match.end():
+                            for rect in t[1]:
+                                self._mark(rect, label)
+                        pos = t_end
 
     # ── Strategy 3: link annotations ─────────────────────────────────────────
 
@@ -831,6 +911,7 @@ def _redact_document(file_bytes: bytes, filename: str,
                 # Text-based page → layered strategies
                 r.redact_via_search(page_text)
                 r.redact_via_words()
+                r.redact_via_word_concat()
                 r.redact_links()
                 r.redact_qr_images()
                 r.redact_text_images()
