@@ -36,6 +36,8 @@ SUPPORTED_EXTENSIONS = {
 
 OCR_LANGUAGES = "eng+vie"
 TEXT_THRESHOLD = 20
+# force_ocr chi ep OCR vai trang dau: OCR moi trang 200 DPI, moi worker chi xu ly 1 tai lieu (2 worker).
+FORCE_OCR_MAX_PAGES = 5
 OCR_DPI = 200  # 200 đủ cho resume/doc, giảm từ 300 → nhanh ~2x
 
 
@@ -143,12 +145,12 @@ def _process_document(file_bytes: bytes, filename: str, mode: str, ocr_lang: str
         if ocr_needed:
             # Pre-check which pages need OCR
             page_data = []
-            for i in indices:
+            for pos, i in enumerate(indices):
                 page = doc[i]
                 text = page.get_text("text") if mode == "text" else ""
                 # force_ocr: CV thiet ke co lop chu mong (vai chuc ky tu > nguong) nhung chu that
-                # la anh/outline — client gui lai voi force_ocr khi text qua ngan.
-                needs_ocr = force_ocr or len(text.strip()) < TEXT_THRESHOLD
+                # la anh/outline — client gui lai voi force_ocr khi text qua ngan. Chi vai trang dau.
+                needs_ocr = (force_ocr and pos < FORCE_OCR_MAX_PAGES) or len(text.strip()) < TEXT_THRESHOLD
                 if needs_ocr:
                     pix = page.get_pixmap(dpi=OCR_DPI)
                     page_data.append((i, text, pix.tobytes("png")))

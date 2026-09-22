@@ -48,3 +48,17 @@ def test_force_ocr_ignored_when_ocr_off(monkeypatch):
     out = m._process_document(_thin_pdf(), "cv.pdf", "text", "off", None, True)
     assert "Photography" in out["text"]
     assert called == []
+
+
+def test_force_ocr_caps_pages(monkeypatch):
+    # Portfolio nhieu trang: force_ocr chi OCR FORCE_OCR_MAX_PAGES trang dau (dich vu chi xu ly 2 tai lieu 1 luc).
+    doc = pymupdf.open()
+    for _ in range(8):
+        doc.new_page().insert_text((72, 72), "Photography Cat, cat and cat")
+    data = doc.tobytes()
+    doc.close()
+    calls = []
+    monkeypatch.setattr(m, "_ocr_page_subprocess", lambda img, lang: calls.append(1) or OCR_TEXT)
+    out = m._process_document(data, "cv.pdf", "text", m.OCR_LANGUAGES, None, True)
+    assert len(calls) == m.FORCE_OCR_MAX_PAGES == 5
+    assert out["ocr_pages"] == 5
