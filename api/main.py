@@ -124,7 +124,7 @@ def _extract_page_text(page: pymupdf.Page, mode: str, ocr: str) -> str:
 
 
 def _process_document(file_bytes: bytes, filename: str, mode: str, ocr_lang: str,
-                      page_indices: list[int] | None = None) -> dict:
+                      page_indices: list[int] | None = None, force_ocr: bool = False) -> dict:
     """Process document - runs in thread pool."""
     ext = _ext_from_filename(filename)
     if ext not in SUPPORTED_EXTENSIONS:
@@ -146,7 +146,9 @@ def _process_document(file_bytes: bytes, filename: str, mode: str, ocr_lang: str
             for i in indices:
                 page = doc[i]
                 text = page.get_text("text") if mode == "text" else ""
-                needs_ocr = len(text.strip()) < TEXT_THRESHOLD
+                # force_ocr: CV thiet ke co lop chu mong (vai chuc ky tu > nguong) nhung chu that
+                # la anh/outline — client gui lai voi force_ocr khi text qua ngan.
+                needs_ocr = force_ocr or len(text.strip()) < TEXT_THRESHOLD
                 if needs_ocr:
                     pix = page.get_pixmap(dpi=OCR_DPI)
                     page_data.append((i, text, pix.tobytes("png")))
@@ -167,15 +169,21 @@ def _process_document(file_bytes: bytes, filename: str, mode: str, ocr_lang: str
 
             # Assemble results
             results = []
+            ocr_pages = 0
             for i, orig_text, img in page_data:
                 if img is not None and i in ocr_results:
                     ocr_text = ocr_results[i]
-                    text = ocr_text if len(ocr_text.strip()) > len((orig_text or "").strip()) else (orig_text or "")
+                    if len(ocr_text.strip()) > len((orig_text or "").strip()):
+                        text = ocr_text
+                        ocr_pages += 1
+                    else:
+                        text = orig_text or ""
                 else:
                     text = _extract_page_text(doc[i], mode, "off")
                 results.append((i, text))
         else:
             results = [(i, _extract_page_text(doc[i], mode, "off")) for i in indices]
+            ocr_pages = 0
 
         if page_indices is not None:
             return {
@@ -183,7 +191,7 @@ def _process_document(file_bytes: bytes, filename: str, mode: str, ocr_lang: str
                 "pages": [{"page": i + 1, "text": t} for i, t in results],
             }
         full_text = "\n\n".join(t for _, t in results)
-        return {"total_pages": total, "text": full_text, "char_count": len(full_text)}
+        return {"total_pages": total, "text": full_text, "char_count": len(full_text), "ocr_pages": ocr_pages}
     finally:
         doc.close()
 
@@ -265,6 +273,7 @@ async def extract(
     url: str = Form(None),
     mode: Literal["text", "blocks", "words"] = Form("text"),
     ocr: str = Form("auto", description="OCR language: 'auto' (eng+vie fallback), 'off', or Tesseract lang code e.g. 'eng+vie'"),
+    force_ocr: bool = Form(False, description="OCR every page even when a text layer exists (design CVs with a thin text layer). Keeps the longer of OCR / text layer per page."),
     _key: str = Depends(verify_api_key),
 ):
     """Extract text from entire document. Provide either `file` (upload) or `url`.
@@ -275,7 +284,7 @@ async def extract(
     loop = asyncio.get_event_loop()
     try:
         result = await loop.run_in_executor(
-            _pool, _process_document, content, filename, mode, ocr_lang, None
+            _pool, _process_document, content, filename, mode, ocr_lang, None, force_ocr
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
@@ -285,6 +294,8 @@ async def extract(
         "text": result["text"],
         "char_count": result["char_count"],
         "ocr": ocr_lang != "off",
+        # "ocr" chi noi OCR DUOC PHEP; so trang thuc su dung chu OCR nam o day.
+        "ocr_pages": result["ocr_pages"],
     }
 
 
